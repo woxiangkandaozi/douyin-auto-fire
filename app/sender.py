@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import random
 import secrets
-from urllib.parse import urlsplit
 
 from playwright.async_api import Locator, Page
 
@@ -24,6 +23,7 @@ SEND_BUTTONS = (
     '[role="button"][aria-label*="发送"]',
 )
 
+
 LATEST_OUTGOING_MESSAGE = (
     '.messageMessageListlist [data-index="0"] '
     ".messageMessageBoxmessageBox:has("
@@ -31,7 +31,9 @@ LATEST_OUTGOING_MESSAGE = (
     ")"
 )
 
+
 MESSAGE_CONFIRM_ANCHOR = "data-douyin-sender-anchor"
+
 
 SEND_FAILURE_MARKERS = (
     "text=发送失败",
@@ -43,6 +45,7 @@ SEND_FAILURE_MARKERS = (
     '[class*="SendStatusretry"]',
 )
 
+
 SEND_PENDING_MARKERS = (
     ".semi-spin",
     '[class*="im-saas-message-spin"]',
@@ -52,16 +55,15 @@ SEND_PENDING_MARKERS = (
 
 async def _get_editor_text(editor: Locator) -> str:
     """
-    尝试获取聊天输入框当前内容。
+    获取聊天输入框当前内容。
 
-    Douyin 的输入框可能是：
+    Douyin 输入框可能是：
     - textarea
     - input
-    - contenteditable div
-    - 带 contenteditable 子节点的 wrapper
+    - contenteditable
+    - contenteditable 外层 wrapper
     """
 
-    # 1. inner_text
     try:
         value = await editor.inner_text(timeout=1000)
         if value:
@@ -69,7 +71,6 @@ async def _get_editor_text(editor: Locator) -> str:
     except Exception:
         pass
 
-    # 2. text_content
     try:
         value = await editor.text_content(timeout=1000)
         if value:
@@ -77,7 +78,6 @@ async def _get_editor_text(editor: Locator) -> str:
     except Exception:
         pass
 
-    # 3. input_value
     try:
         value = await editor.input_value(timeout=1000)
         if value:
@@ -85,12 +85,17 @@ async def _get_editor_text(editor: Locator) -> str:
     except Exception:
         pass
 
-    # 4. contenteditable 属性
     try:
-        value = await editor.get_attribute("contenteditable")
-        if value == "true":
-            text = await editor.inner_text(timeout=1000)
-            return text or ""
+        contenteditable = await editor.get_attribute(
+            "contenteditable"
+        )
+
+        if contenteditable in (
+            "true",
+            "plaintext-only",
+        ):
+            value = await editor.inner_text(timeout=1000)
+            return value or ""
     except Exception:
         pass
 
@@ -99,10 +104,9 @@ async def _get_editor_text(editor: Locator) -> str:
 
 async def _find_real_editable(editor: Locator) -> Locator:
     """
-    message_input() 有可能返回 wrapper，而不是实际可以输入文字的元素。
+    message_input() 有可能返回输入框 wrapper。
 
-    因此这里进一步寻找：
-    textarea / input / contenteditable。
+    这里继续寻找真正可编辑的元素。
     """
 
     candidates = [
@@ -123,7 +127,7 @@ async def _find_real_editable(editor: Locator) -> Locator:
         if count <= 0:
             continue
 
-        for index in range(min(count, 5)):
+        for index in range(min(count, 10)):
             item = candidate.nth(index)
 
             try:
@@ -133,16 +137,20 @@ async def _find_real_editable(editor: Locator) -> Locator:
                 continue
 
             try:
-                editable = await item.is_editable()
-                if editable:
+                if await item.is_editable():
                     return item
             except Exception:
                 pass
 
-            # contenteditable 元素有时候 is_editable() 判断不稳定
             try:
-                ce = await item.get_attribute("contenteditable")
-                if ce in ("true", "plaintext-only"):
+                contenteditable = await item.get_attribute(
+                    "contenteditable"
+                )
+
+                if contenteditable in (
+                    "true",
+                    "plaintext-only",
+                ):
                     return item
             except Exception:
                 pass
@@ -158,11 +166,13 @@ async def _wait_editor_text(
     """
     使用 Python + Playwright 轮询输入框内容。
 
-    不使用 page.wait_for_function()，避免 GitHub Actions
-    上出现 JavaScript 解析问题。
+    不使用 page.wait_for_function()。
     """
 
-    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+    deadline = (
+        asyncio.get_running_loop().time()
+        + timeout_ms / 1000
+    )
 
     while asyncio.get_running_loop().time() < deadline:
         try:
@@ -171,8 +181,6 @@ async def _wait_editor_text(
             if current == expected:
                 return True
 
-            # 某些 contenteditable 会把换行、空格处理掉，
-            # 因此这里允许包含完整目标文本。
             if expected and expected in current:
                 return True
 
@@ -186,7 +194,7 @@ async def _wait_editor_text(
 
 async def _print_editor_debug(editor: Locator) -> None:
     """
-    打印输入框详细信息，方便 GitHub Actions 日志定位真正的 DOM。
+    输出输入框详细 DOM 信息。
     """
 
     print()
@@ -195,8 +203,7 @@ async def _print_editor_debug(editor: Locator) -> None:
     print("=" * 70)
 
     try:
-        count = await editor.count()
-        print(f"元素数量: {count}")
+        print(f"元素数量: {await editor.count()}")
     except Exception as exc:
         print(f"元素数量获取失败: {exc}")
 
@@ -210,8 +217,15 @@ async def _print_editor_debug(editor: Locator) -> None:
     except Exception as exc:
         print(f"可编辑状态获取失败: {exc}")
 
+    try:
+        tag_name = await editor.evaluate(
+            "(el) => el.tagName"
+        )
+        print(f"tagName: {tag_name}")
+    except Exception as exc:
+        print(f"tagName 获取失败: {exc}")
+
     for attr in (
-        "tagName",
         "contenteditable",
         "role",
         "class",
@@ -219,19 +233,14 @@ async def _print_editor_debug(editor: Locator) -> None:
         "aria-label",
     ):
         try:
-            if attr == "tagName":
-                value = await editor.evaluate(
-                    "(el) => el.tagName"
-                )
-            else:
-                value = await editor.get_attribute(attr)
-
+            value = await editor.get_attribute(attr)
             print(f"{attr}: {value}")
         except Exception as exc:
             print(f"{attr}: 获取失败 ({exc})")
 
     try:
-        print(f"当前文本: {await _get_editor_text(editor)!r}")
+        value = await _get_editor_text(editor)
+        print(f"当前文本: {value!r}")
     except Exception as exc:
         print(f"当前文本获取失败: {exc}")
 
@@ -241,9 +250,11 @@ async def _print_editor_debug(editor: Locator) -> None:
         )
 
         if html:
-            # 防止日志太长
             if len(html) > 8000:
-                html = html[:8000] + "...[truncated]"
+                html = (
+                    html[:8000]
+                    + "...[truncated]"
+                )
 
             print()
             print("输入框 HTML:")
@@ -258,17 +269,15 @@ async def _print_editor_debug(editor: Locator) -> None:
 
 async def _clear_editor(editor: Locator) -> None:
     """
-    尝试清空输入框。
+    清空输入框。
     """
 
-    # textarea / input
     try:
         await editor.fill("")
         return
     except Exception:
         pass
 
-    # contenteditable
     try:
         await editor.click(force=True)
         await editor.press("Control+A")
@@ -277,7 +286,6 @@ async def _clear_editor(editor: Locator) -> None:
     except Exception:
         pass
 
-    # Mac runner 兜底
     try:
         await editor.click(force=True)
         await editor.press("Meta+A")
@@ -291,19 +299,17 @@ async def _input_text_with_fallback(
     content: str,
 ) -> bool:
     """
-    向聊天输入框写入文字。
+    多种方式尝试输入文字：
 
-    按以下顺序尝试：
-
-    1. fill()
-    2. click + press_sequentially()
-    3. click + keyboard.insert_text()
-    4. contenteditable 子节点
-    5. role=textbox 子节点
+    1. fill
+    2. press_sequentially
+    3. keyboard.insert_text
+    4. 寻找真正的 contenteditable
+    5. 寻找 textarea/input/role=textbox
     """
 
     # ============================================================
-    # 方法 1：直接 fill
+    # 方法 1：fill()
     # ============================================================
 
     try:
@@ -311,35 +317,52 @@ async def _input_text_with_fallback(
 
         await editor.fill(content)
 
-        if await _wait_editor_text(editor, content, 1500):
+        if await _wait_editor_text(
+            editor,
+            content,
+            1500,
+        ):
             print("文字输入方式: fill()")
             return True
 
     except Exception as exc:
-        print(f"fill() 输入失败: {exc}")
+        print(
+            f"fill() 输入失败: {exc}"
+        )
 
     # ============================================================
-    # 方法 2：逐字输入
+    # 方法 2：press_sequentially()
     # ============================================================
 
     try:
         await _clear_editor(editor)
 
         await editor.click(force=True)
+
         await editor.press_sequentially(
             content,
             delay=20,
         )
 
-        if await _wait_editor_text(editor, content, 3000):
-            print("文字输入方式: press_sequentially()")
+        if await _wait_editor_text(
+            editor,
+            content,
+            3000,
+        ):
+            print(
+                "文字输入方式: "
+                "press_sequentially()"
+            )
             return True
 
     except Exception as exc:
-        print(f"press_sequentially() 输入失败: {exc}")
+        print(
+            "press_sequentially() "
+            f"输入失败: {exc}"
+        )
 
     # ============================================================
-    # 方法 3：keyboard.insert_text
+    # 方法 3：keyboard.insert_text()
     # ============================================================
 
     try:
@@ -354,23 +377,41 @@ async def _input_text_with_fallback(
         except Exception:
             pass
 
-        await page.keyboard.insert_text(content)
+        await page.keyboard.insert_text(
+            content
+        )
 
-        if await _wait_editor_text(editor, content, 3000):
-            print("文字输入方式: keyboard.insert_text()")
+        if await _wait_editor_text(
+            editor,
+            content,
+            3000,
+        ):
+            print(
+                "文字输入方式: "
+                "keyboard.insert_text()"
+            )
             return True
 
     except Exception as exc:
-        print(f"keyboard.insert_text() 输入失败: {exc}")
+        print(
+            "keyboard.insert_text() "
+            f"输入失败: {exc}"
+        )
 
     # ============================================================
-    # 方法 4：寻找真正的 contenteditable
+    # 方法 4：寻找真正的子输入框
     # ============================================================
 
     nested_candidates = [
-        editor.locator('[contenteditable="true"]'),
-        editor.locator('[contenteditable="plaintext-only"]'),
-        editor.locator('[role="textbox"]'),
+        editor.locator(
+            '[contenteditable="true"]'
+        ),
+        editor.locator(
+            '[contenteditable="plaintext-only"]'
+        ),
+        editor.locator(
+            '[role="textbox"]'
+        ),
         editor.locator("textarea"),
         editor.locator("input"),
     ]
@@ -384,7 +425,9 @@ async def _input_text_with_fallback(
         if count <= 0:
             continue
 
-        for index in range(min(count, 10)):
+        for index in range(
+            min(count, 10)
+        ):
             child = candidate.nth(index)
 
             try:
@@ -399,11 +442,17 @@ async def _input_text_with_fallback(
 
             try:
                 await _clear_editor(child)
+
                 await child.fill(content)
 
-                if await _wait_editor_text(child, content, 1500):
+                if await _wait_editor_text(
+                    child,
+                    content,
+                    1500,
+                ):
                     print(
-                        "文字输入方式: nested.fill()"
+                        "文字输入方式: "
+                        "nested.fill()"
                     )
                     return True
 
@@ -416,13 +465,21 @@ async def _input_text_with_fallback(
 
             try:
                 await _clear_editor(child)
-                await child.click(force=True)
+
+                await child.click(
+                    force=True
+                )
+
                 await child.press_sequentially(
                     content,
                     delay=20,
                 )
 
-                if await _wait_editor_text(child, content, 2500):
+                if await _wait_editor_text(
+                    child,
+                    content,
+                    2500,
+                ):
                     print(
                         "文字输入方式: "
                         "nested.press_sequentially()"
@@ -433,12 +490,15 @@ async def _input_text_with_fallback(
                 pass
 
             # ----------------------------------------------------
-            # 4.3 insert_text
+            # 4.3 keyboard.insert_text
             # ----------------------------------------------------
 
             try:
                 await _clear_editor(child)
-                await child.click(force=True)
+
+                await child.click(
+                    force=True
+                )
 
                 page = child.page
 
@@ -447,9 +507,15 @@ async def _input_text_with_fallback(
                 except Exception:
                     pass
 
-                await page.keyboard.insert_text(content)
+                await page.keyboard.insert_text(
+                    content
+                )
 
-                if await _wait_editor_text(child, content, 2500):
+                if await _wait_editor_text(
+                    child,
+                    content,
+                    2500,
+                ):
                     print(
                         "文字输入方式: "
                         "nested.keyboard.insert_text()"
@@ -462,23 +528,28 @@ async def _input_text_with_fallback(
     return False
 
 
-async def _mark_latest_outgoing_message(page: Page) -> str | None:
+async def _mark_latest_outgoing_message(
+    page: Page,
+) -> str | None:
     """
-    给当前最新的自己发送的消息打一个临时标记。
-
-    用于后续判断发送是否产生了新的消息。
+    给当前最新的自己发送消息打临时标记。
     """
 
     try:
-        locator = page.locator(LATEST_OUTGOING_MESSAGE).first
+        locator = page.locator(
+            LATEST_OUTGOING_MESSAGE
+        ).first
 
         if await locator.count() == 0:
             return None
 
         try:
-            return await locator.get_attribute(
+            existing = await locator.get_attribute(
                 MESSAGE_CONFIRM_ANCHOR
             )
+
+            if existing:
+                return existing
         except Exception:
             pass
 
@@ -488,7 +559,10 @@ async def _mark_latest_outgoing_message(page: Page) -> str | None:
             await locator.evaluate(
                 """
                 (el, data) => {
-                    el.setAttribute(data.name, data.value);
+                    el.setAttribute(
+                        data.name,
+                        data.value
+                    );
                 }
                 """,
                 {
@@ -510,19 +584,23 @@ async def _find_visible_marker(
     markers: tuple[str, ...],
 ) -> Locator | None:
     """
-    寻找页面中可见的 selector。
+    查找页面中可见的 selector。
     """
 
     for selector in markers:
         try:
-            locator = page.locator(selector)
+            locator = page.locator(
+                selector
+            )
 
             count = await locator.count()
 
             if count <= 0:
                 continue
 
-            for index in range(min(count, 10)):
+            for index in range(
+                min(count, 10)
+            ):
                 item = locator.nth(index)
 
                 try:
@@ -537,9 +615,11 @@ async def _find_visible_marker(
     return None
 
 
-async def _raise_send_failure(page: Page) -> None:
+async def _raise_send_failure(
+    page: Page,
+) -> None:
     """
-    检查页面上是否出现发送失败标志。
+    检查页面是否出现发送失败。
     """
 
     marker = await _find_visible_marker(
@@ -554,29 +634,42 @@ async def _raise_send_failure(page: Page) -> None:
 
     try:
         text = await marker.inner_text()
+
         if text:
-            details.append(text.strip())
+            details.append(
+                text.strip()
+            )
     except Exception:
         pass
 
     try:
-        title = await marker.get_attribute("title")
+        title = await marker.get_attribute(
+            "title"
+        )
+
         if title:
             details.append(title)
     except Exception:
         pass
 
     try:
-        aria = await marker.get_attribute("aria-label")
+        aria = await marker.get_attribute(
+            "aria-label"
+        )
+
         if aria:
             details.append(aria)
     except Exception:
         pass
 
-    message = "；".join(x for x in details if x)
+    message = "；".join(
+        x for x in details if x
+    )
 
     if not message:
-        message = "页面检测到发送失败状态"
+        message = (
+            "页面检测到发送失败状态"
+        )
 
     raise PageOperationError(
         f"文字发送失败: {message}"
@@ -588,9 +681,7 @@ async def _await_send_terminal_state(
     timeout_ms: int = 15000,
 ) -> None:
     """
-    等待发送进入最终状态。
-
-    如果出现失败标记立即抛错。
+    等待发送状态结束。
     """
 
     deadline = (
@@ -598,7 +689,10 @@ async def _await_send_terminal_state(
         + timeout_ms / 1000
     )
 
-    while asyncio.get_running_loop().time() < deadline:
+    while (
+        asyncio.get_running_loop().time()
+        < deadline
+    ):
         await _raise_send_failure(page)
 
         pending = await _find_visible_marker(
@@ -611,7 +705,6 @@ async def _await_send_terminal_state(
 
         await asyncio.sleep(0.2)
 
-    # 超时前再检查一次失败
     await _raise_send_failure(page)
 
 
@@ -621,7 +714,7 @@ async def _wait_for_new_outgoing_message(
     timeout_ms: int = 15000,
 ) -> bool:
     """
-    Python/Playwright 轮询是否出现新的自己发送的消息。
+    等待新的自己发送消息出现。
     """
 
     deadline = (
@@ -629,7 +722,10 @@ async def _wait_for_new_outgoing_message(
         + timeout_ms / 1000
     )
 
-    while asyncio.get_running_loop().time() < deadline:
+    while (
+        asyncio.get_running_loop().time()
+        < deadline
+    ):
         await _raise_send_failure(page)
 
         try:
@@ -656,11 +752,13 @@ async def _wait_for_new_outgoing_message(
     return False
 
 
-async def _trigger_send(page: Page) -> None:
+async def _trigger_send(
+    page: Page,
+) -> None:
     """
     点击发送按钮。
 
-    多种 selector 依次尝试。
+    找不到发送按钮时使用 Enter。
     """
 
     button = await first_visible(
@@ -677,16 +775,19 @@ async def _trigger_send(page: Page) -> None:
             return
         except Exception as exc:
             print(
-                f"发送按钮 click 失败，尝试 Enter: {exc}"
+                "发送按钮 click 失败，"
+                f"尝试 Enter: {exc}"
             )
 
-    # 找不到按钮或者点击失败时，尝试 Enter
     try:
-        await page.keyboard.press("Enter")
+        await page.keyboard.press(
+            "Enter"
+        )
         return
     except Exception as exc:
         raise PageOperationError(
-            f"无法点击发送按钮，也无法按 Enter 发送: {exc}"
+            "无法点击发送按钮，也无法按 Enter 发送: "
+            f"{exc}"
         )
 
 
@@ -695,16 +796,14 @@ async def _confirm_outgoing_message(
     before_marker: str | None,
 ) -> None:
     """
-    确认消息已经真正进入聊天记录。
+    确认消息已经进入聊天记录。
     """
 
-    # 先等待发送状态结束
     await _await_send_terminal_state(
         page,
         timeout_ms=10000,
     )
 
-    # 等待新的自己发送的消息出现
     success = await _wait_for_new_outgoing_message(
         page,
         before_marker,
@@ -714,7 +813,6 @@ async def _confirm_outgoing_message(
     if success:
         return
 
-    # 最后一轮检查失败状态
     await _raise_send_failure(page)
 
     raise PageOperationError(
@@ -728,8 +826,6 @@ async def send_text(
 ) -> None:
     """
     发送文字消息。
-
-    这是本次重点修复的函数。
     """
 
     if not content:
@@ -739,13 +835,13 @@ async def send_text(
 
     print()
     print("=" * 70)
-    print(f"准备发送文字，长度: {len(content)}")
-    print(f"文字内容: {content!r}")
+    print(
+        f"准备发送文字，长度: {len(content)}"
+    )
+    print(
+        f"文字内容: {content!r}"
+    )
     print("=" * 70)
-
-    # ------------------------------------------------------------
-    # 获取聊天输入框
-    # ------------------------------------------------------------
 
     editor = await chat.message_input()
 
@@ -754,15 +850,9 @@ async def send_text(
             "没有找到聊天输入框"
         )
 
-    # ------------------------------------------------------------
-    # 找真正可编辑的元素
-    # ------------------------------------------------------------
-
-    editor = await _find_real_editable(editor)
-
-    # ------------------------------------------------------------
-    # 输入文字
-    # ------------------------------------------------------------
+    editor = await _find_real_editable(
+        editor
+    )
 
     success = await _input_text_with_fallback(
         editor,
@@ -771,17 +861,17 @@ async def send_text(
 
     if not success:
         print()
-        print("文字输入失败，输出输入框详细信息。")
+        print(
+            "文字输入失败，输出输入框详细信息。"
+        )
 
-        await _print_editor_debug(editor)
+        await _print_editor_debug(
+            editor
+        )
 
         raise PageOperationError(
             "文字未能写入聊天输入框"
         )
-
-    # ------------------------------------------------------------
-    # 最终确认输入框里确实存在文字
-    # ------------------------------------------------------------
 
     ready = await _wait_editor_text(
         editor,
@@ -791,21 +881,22 @@ async def send_text(
 
     if not ready:
         print()
-        print("输入框最终确认失败。")
-        await _print_editor_debug(editor)
+        print(
+            "输入框最终确认失败。"
+        )
+
+        await _print_editor_debug(
+            editor
+        )
 
         raise PageOperationError(
             "文字输入框内容确认失败"
         )
 
     print(
-        f"文字已写入输入框: "
+        "文字已写入输入框: "
         f"{await _get_editor_text(editor)!r}"
     )
-
-    # ------------------------------------------------------------
-    # 在发送之前记录最新消息
-    # ------------------------------------------------------------
 
     page = editor.page
 
@@ -815,17 +906,9 @@ async def send_text(
 
     await page.wait_for_timeout(300)
 
-    # ------------------------------------------------------------
-    # 点击发送
-    # ------------------------------------------------------------
-
     await _trigger_send(page)
 
     print("已触发发送动作。")
-
-    # ------------------------------------------------------------
-    # 确认发送结果
-    # ------------------------------------------------------------
 
     await _confirm_outgoing_message(
         page,
@@ -878,7 +961,7 @@ async def _open_sticker_panel(
     page: Page,
 ) -> Locator:
     """
-    打开表情/贴纸面板。
+    打开贴纸面板。
     """
 
     button = await first_visible(
@@ -929,7 +1012,6 @@ async def send_sticker(
         page
     )
 
-    # sticker selector 由 Sticker 模型提供
     selector = getattr(
         sticker,
         "selector",
@@ -974,11 +1056,25 @@ async def send_sticker(
 
 
 async def send_message(
+    page: Page,
     chat: DouyinChat,
     message: Message,
+    task_sticker=None,
 ) -> None:
     """
     根据 Message 类型发送消息。
+
+    注意：
+    main.py 当前调用方式是：
+
+        send_message(
+            page,
+            chat,
+            message,
+            task_sticker,
+        )
+
+    所以这里必须保持 4 个参数。
     """
 
     message_type = getattr(
@@ -987,9 +1083,9 @@ async def send_message(
         None,
     )
 
-    # ------------------------------------------------------------
-    # 文字
-    # ------------------------------------------------------------
+    # ============================================================
+    # 文字消息
+    # ============================================================
 
     if message_type in (
         "text",
@@ -1018,11 +1114,12 @@ async def send_message(
             chat,
             str(content),
         )
+
         return
 
-    # ------------------------------------------------------------
-    # 图片
-    # ------------------------------------------------------------
+    # ============================================================
+    # 图片消息
+    # ============================================================
 
     if message_type in (
         "image",
@@ -1050,11 +1147,12 @@ async def send_message(
             chat,
             str(image_path),
         )
+
         return
 
-    # ------------------------------------------------------------
-    # 贴纸
-    # ------------------------------------------------------------
+    # ============================================================
+    # 贴纸消息
+    # ============================================================
 
     if message_type in (
         "sticker",
@@ -1068,6 +1166,11 @@ async def send_message(
             None,
         )
 
+        # 如果 Message 自己没有 sticker，
+        # 使用 main.py 传入的 task_sticker。
+        if sticker is None:
+            sticker = task_sticker
+
         if sticker is None:
             raise PageOperationError(
                 "贴纸消息没有 sticker"
@@ -1077,11 +1180,12 @@ async def send_message(
             chat,
             sticker,
         )
+
         return
 
-    # ------------------------------------------------------------
+    # ============================================================
     # 随机消息
-    # ------------------------------------------------------------
+    # ============================================================
 
     if message_type in (
         "random",
@@ -1109,11 +1213,15 @@ async def send_message(
             candidates
         )
 
-        if isinstance(selected, str):
+        if isinstance(
+            selected,
+            str,
+        ):
             await send_text(
                 chat,
                 selected,
             )
+
             return
 
         await send_message(
@@ -1122,8 +1230,14 @@ async def send_message(
             selected,
             task_sticker,
         )
+
         return
 
+    # ============================================================
+    # 未知消息类型
+    # ============================================================
+
     raise PageOperationError(
-        f"不支持的消息类型: {message_type!r}"
+        f"不支持的消息类型: "
+        f"{message_type!r}"
     )
