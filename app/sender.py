@@ -17,67 +17,12 @@ from app.selectors import (
 )
 
 
-def _monotonic() -> float:
-    """Monotonic clock for the send-state deadline."""
-    return asyncio.get_running_loop().time()
-
-
-# ============================================================
-# 发送按钮
-# ============================================================
-
 SEND_BUTTONS = (
     '[class*="messageMsgInputpublishBtn"]',
     ".e2e-send-msg-bt",
     'button[aria-label*="发送"]',
     '[role="button"][aria-label*="发送"]',
 )
-
-
-async def _trigger_send(page: Page) -> None:
-    """
-    尝试点击发送按钮。
-    如果找不到发送按钮，则使用 Enter。
-    """
-    button = None
-
-    for selector in SEND_BUTTONS:
-        candidate = page.locator(selector).first
-
-        try:
-            if await candidate.count() and await candidate.is_visible():
-                button = candidate
-                break
-        except Exception:
-            continue
-
-    if button is not None:
-        try:
-            await button.click()
-            return
-        except Exception:
-            pass
-
-    await page.keyboard.press("Enter")
-
-
-async def _publish_ready(page: Page) -> bool:
-    """判断当前页面是否存在可见的发送按钮。"""
-    for selector in SEND_BUTTONS:
-        candidate = page.locator(selector).first
-
-        try:
-            if await candidate.count() and await candidate.is_visible():
-                return True
-        except Exception:
-            continue
-
-    return False
-
-
-# ============================================================
-# 最新发送消息
-# ============================================================
 
 LATEST_OUTGOING_MESSAGE = (
     '.messageMessageListlist [data-index="0"] '
@@ -87,11 +32,6 @@ LATEST_OUTGOING_MESSAGE = (
 )
 
 MESSAGE_CONFIRM_ANCHOR = "data-douyin-sender-anchor"
-
-
-# ============================================================
-# 发送状态
-# ============================================================
 
 SEND_FAILURE_MARKERS = (
     "text=发送失败",
@@ -103,7 +43,6 @@ SEND_FAILURE_MARKERS = (
     '[class*="SendStatusretry"]',
 )
 
-
 SEND_PENDING_MARKERS = (
     ".semi-spin",
     '[class*="im-saas-message-spin"]',
@@ -111,903 +50,486 @@ SEND_PENDING_MARKERS = (
 )
 
 
-# ============================================================
-# 时间参数
-# ============================================================
-
-SEND_CONFIRM_TIMEOUT_MS = 15_000
-SEND_POLL_INTERVAL_MS = 300
-SEND_STABLE_INTERVAL_MS = 500
-SEND_INITIAL_CLEAN_GRACE_MS = 2_000
-
-
-# ============================================================
-# 发送消息总入口
-# ============================================================
-
-async def send_message(
-    page: Page,
-    chat: DouyinChat,
-    message: Message,
-    stickers: dict[str, Sticker],
-) -> None:
-
-    if message.type == "random":
-        await send_message(
-            page,
-            chat,
-            random.choice(message.choices),
-            stickers,
-        )
-        return
-
-    if message.type == "text":
-        await send_text(
-            chat,
-            message.content or "",
-        )
-        return
-
-    if message.type == "image":
-        if message.path is None:
-            raise PageOperationError("图片消息缺少文件路径")
-
-        await send_image(
-            page,
-            message.path.as_posix(),
-        )
-        return
-
-    if message.type == "douyin_sticker":
-        sticker = stickers.get(message.sticker or "")
-
-        if sticker is None:
-            raise PageOperationError(
-                f"没有原生表情映射: {message.sticker}"
-            )
-
-        await send_douyin_sticker(
-            page,
-            sticker,
-        )
-        return
-
-    raise PageOperationError(
-        f"不支持的消息类型: {message.type}"
-    )
-
-
-# ============================================================
-# 获取输入框文字
-# ============================================================
-
 async def _get_editor_text(editor: Locator) -> str:
     """
-    尽可能读取聊天输入框中的文字。
+    尝试获取聊天输入框当前内容。
 
-    抖音的输入框可能是 contenteditable，
-    也可能是其他可编辑 DOM，因此这里依次尝试：
-    inner_text / text_content / input_value。
+    Douyin 的输入框可能是：
+    - textarea
+    - input
+    - contenteditable div
+    - 带 contenteditable 子节点的 wrapper
     """
 
+    # 1. inner_text
     try:
-        text = await editor.inner_text()
-        if text:
-            return text
-    except Exception:
-        pass
-
-    try:
-        text = await editor.text_content()
-        if text:
-            return text
-    except Exception:
-        pass
-
-    try:
-        value = await editor.input_value()
+        value = await editor.inner_text(timeout=1000)
         if value:
             return value
+    except Exception:
+        pass
+
+    # 2. text_content
+    try:
+        value = await editor.text_content(timeout=1000)
+        if value:
+            return value
+    except Exception:
+        pass
+
+    # 3. input_value
+    try:
+        value = await editor.input_value(timeout=1000)
+        if value:
+            return value
+    except Exception:
+        pass
+
+    # 4. contenteditable 属性
+    try:
+        value = await editor.get_attribute("contenteditable")
+        if value == "true":
+            text = await editor.inner_text(timeout=1000)
+            return text or ""
     except Exception:
         pass
 
     return ""
 
 
-# ============================================================
-# 等待输入框出现指定文字
-# ============================================================
+async def _find_real_editable(editor: Locator) -> Locator:
+    """
+    message_input() 有可能返回 wrapper，而不是实际可以输入文字的元素。
+
+    因此这里进一步寻找：
+    textarea / input / contenteditable。
+    """
+
+    candidates = [
+        editor,
+        editor.locator("textarea"),
+        editor.locator("input"),
+        editor.locator('[contenteditable="true"]'),
+        editor.locator('[contenteditable="plaintext-only"]'),
+        editor.locator('[role="textbox"]'),
+    ]
+
+    for candidate in candidates:
+        try:
+            count = await candidate.count()
+        except Exception:
+            continue
+
+        if count <= 0:
+            continue
+
+        for index in range(min(count, 5)):
+            item = candidate.nth(index)
+
+            try:
+                if not await item.is_visible():
+                    continue
+            except Exception:
+                continue
+
+            try:
+                editable = await item.is_editable()
+                if editable:
+                    return item
+            except Exception:
+                pass
+
+            # contenteditable 元素有时候 is_editable() 判断不稳定
+            try:
+                ce = await item.get_attribute("contenteditable")
+                if ce in ("true", "plaintext-only"):
+                    return item
+            except Exception:
+                pass
+
+    return editor
+
 
 async def _wait_editor_text(
     editor: Locator,
     expected: str,
-    timeout_ms: int = 5_000,
+    timeout_ms: int = 5000,
 ) -> bool:
     """
-    使用 Python + Playwright 轮询输入框。
+    使用 Python + Playwright 轮询输入框内容。
 
-    不使用 page.wait_for_function，
-    避免 Chromium 对 JavaScript 表达式解析失败。
+    不使用 page.wait_for_function()，避免 GitHub Actions
+    上出现 JavaScript 解析问题。
     """
 
-    deadline = (
-        _monotonic()
-        + timeout_ms / 1000
-    )
+    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
 
-    while _monotonic() < deadline:
-
+    while asyncio.get_running_loop().time() < deadline:
         try:
-            if await editor.count() and await editor.is_visible():
+            current = await _get_editor_text(editor)
 
-                current = await _get_editor_text(editor)
+            if current == expected:
+                return True
 
-                if expected in current:
-                    return True
+            # 某些 contenteditable 会把换行、空格处理掉，
+            # 因此这里允许包含完整目标文本。
+            if expected and expected in current:
+                return True
 
         except Exception:
             pass
 
-        await editor.page.wait_for_timeout(
-            SEND_POLL_INTERVAL_MS
-        )
+        await asyncio.sleep(0.15)
 
     return False
 
 
-# ============================================================
-# 发送文字
-# ============================================================
+async def _print_editor_debug(editor: Locator) -> None:
+    """
+    打印输入框详细信息，方便 GitHub Actions 日志定位真正的 DOM。
+    """
 
-async def send_text(
-    chat: DouyinChat,
-    content: str,
-) -> None:
+    print()
+    print("=" * 70)
+    print("输入框调试信息")
+    print("=" * 70)
 
-    editor = await chat.message_input()
-    page = editor.page
+    try:
+        count = await editor.count()
+        print(f"元素数量: {count}")
+    except Exception as exc:
+        print(f"元素数量获取失败: {exc}")
 
-    # 点击输入框
-    await editor.click()
+    try:
+        print(f"可见: {await editor.is_visible()}")
+    except Exception as exc:
+        print(f"可见状态获取失败: {exc}")
 
-    # 输入文字
-    await page.keyboard.insert_text(content)
+    try:
+        print(f"可编辑: {await editor.is_editable()}")
+    except Exception as exc:
+        print(f"可编辑状态获取失败: {exc}")
 
-    # --------------------------------------------------------
-    # 确认文字进入输入框
-    # --------------------------------------------------------
-
-    ready = await _wait_editor_text(
-        editor,
-        content,
-        timeout_ms=5_000,
-    )
-
-    if not ready:
-        # 输出一点调试信息，但绝不输出 Cookie 等敏感信息
+    for attr in (
+        "tagName",
+        "contenteditable",
+        "role",
+        "class",
+        "placeholder",
+        "aria-label",
+    ):
         try:
-            current_text = await _get_editor_text(editor)
-        except Exception:
-            current_text = ""
+            if attr == "tagName":
+                value = await editor.evaluate(
+                    "(el) => el.tagName"
+                )
+            else:
+                value = await editor.get_attribute(attr)
 
-        print("")
-        print("=" * 70)
-        print("输入框调试信息")
-        print("=" * 70)
-        print(f"期望文字长度: {len(content)}")
-        print(f"当前文字长度: {len(current_text)}")
-        print(f"当前文字: {current_text[:500]!r}")
-        print("=" * 70)
-        print("")
+            print(f"{attr}: {value}")
+        except Exception as exc:
+            print(f"{attr}: 获取失败 ({exc})")
 
-        raise PageOperationError(
-            "文字未能写入聊天输入框"
+    try:
+        print(f"当前文本: {await _get_editor_text(editor)!r}")
+    except Exception as exc:
+        print(f"当前文本获取失败: {exc}")
+
+    try:
+        html = await editor.evaluate(
+            "(el) => el.outerHTML"
         )
 
-    # --------------------------------------------------------
-    # 记录发送前的最新消息
-    # --------------------------------------------------------
+        if html:
+            # 防止日志太长
+            if len(html) > 8000:
+                html = html[:8000] + "...[truncated]"
 
-    before = await _mark_latest_outgoing_message(page)
+            print()
+            print("输入框 HTML:")
+            print(html)
 
-    # 给 DOM 一点时间
-    await page.wait_for_timeout(300)
+    except Exception as exc:
+        print(f"outerHTML 获取失败: {exc}")
 
-    # --------------------------------------------------------
-    # 点击发送
-    # --------------------------------------------------------
-
-    await _trigger_send(page)
-
-    # --------------------------------------------------------
-    # 等待发送结果
-    # --------------------------------------------------------
-
-    await _confirm_outgoing_message(
-        page,
-        before,
-        label="文字",
-        expected_text=content,
-    )
+    print("=" * 70)
+    print()
 
 
-# ============================================================
-# 发送图片
-# ============================================================
+async def _clear_editor(editor: Locator) -> None:
+    """
+    尝试清空输入框。
+    """
 
-async def send_image(
-    page: Page,
-    image_path: str,
-) -> None:
+    # textarea / input
+    try:
+        await editor.fill("")
+        return
+    except Exception:
+        pass
 
-    before = await _mark_latest_outgoing_message(page)
+    # contenteditable
+    try:
+        await editor.click(force=True)
+        await editor.press("Control+A")
+        await editor.press("Backspace")
+        return
+    except Exception:
+        pass
 
-    file_input = None
+    # Mac runner 兜底
+    try:
+        await editor.click(force=True)
+        await editor.press("Meta+A")
+        await editor.press("Backspace")
+    except Exception:
+        pass
 
-    for selector in IMAGE_INPUTS:
-        candidate = page.locator(selector).first
+
+async def _input_text_with_fallback(
+    editor: Locator,
+    content: str,
+) -> bool:
+    """
+    向聊天输入框写入文字。
+
+    按以下顺序尝试：
+
+    1. fill()
+    2. click + press_sequentially()
+    3. click + keyboard.insert_text()
+    4. contenteditable 子节点
+    5. role=textbox 子节点
+    """
+
+    # ============================================================
+    # 方法 1：直接 fill
+    # ============================================================
+
+    try:
+        await _clear_editor(editor)
+
+        await editor.fill(content)
+
+        if await _wait_editor_text(editor, content, 1500):
+            print("文字输入方式: fill()")
+            return True
+
+    except Exception as exc:
+        print(f"fill() 输入失败: {exc}")
+
+    # ============================================================
+    # 方法 2：逐字输入
+    # ============================================================
+
+    try:
+        await _clear_editor(editor)
+
+        await editor.click(force=True)
+        await editor.press_sequentially(
+            content,
+            delay=20,
+        )
+
+        if await _wait_editor_text(editor, content, 3000):
+            print("文字输入方式: press_sequentially()")
+            return True
+
+    except Exception as exc:
+        print(f"press_sequentially() 输入失败: {exc}")
+
+    # ============================================================
+    # 方法 3：keyboard.insert_text
+    # ============================================================
+
+    try:
+        await _clear_editor(editor)
+
+        page = editor.page
+
+        await editor.click(force=True)
 
         try:
-            if await candidate.count():
-                file_input = candidate
-                break
+            await editor.focus()
+        except Exception:
+            pass
+
+        await page.keyboard.insert_text(content)
+
+        if await _wait_editor_text(editor, content, 3000):
+            print("文字输入方式: keyboard.insert_text()")
+            return True
+
+    except Exception as exc:
+        print(f"keyboard.insert_text() 输入失败: {exc}")
+
+    # ============================================================
+    # 方法 4：寻找真正的 contenteditable
+    # ============================================================
+
+    nested_candidates = [
+        editor.locator('[contenteditable="true"]'),
+        editor.locator('[contenteditable="plaintext-only"]'),
+        editor.locator('[role="textbox"]'),
+        editor.locator("textarea"),
+        editor.locator("input"),
+    ]
+
+    for candidate in nested_candidates:
+        try:
+            count = await candidate.count()
         except Exception:
             continue
 
-    if file_input is None:
-        raise PageOperationError(
-            "找不到图片上传控件"
-        )
+        if count <= 0:
+            continue
 
-    await file_input.set_input_files(
-        image_path
-    )
-
-    # 等待图片加载
-    await page.wait_for_timeout(1_500)
-
-    # 点击发送
-    await _trigger_send(page)
-
-    try:
-
-        if not await _wait_for_new_outgoing_message(
-            page,
-            before,
-            timeout_ms=15_000,
-        ):
-            raise PageOperationError(
-                "图片消息已触发发送，但无法确认新消息"
-            )
-
-        latest = page.locator(
-            LATEST_OUTGOING_MESSAGE
-        ).first
-
-        await _await_send_terminal_state(
-            page,
-            latest,
-            "图片",
-        )
-
-    except PageOperationError:
-        raise
-
-    except Exception as exc:
-        raise PageOperationError(
-            "图片消息已触发发送，但无法确认是否发送成功；"
-            "为避免重复不会自动重试"
-        ) from exc
-
-
-# ============================================================
-# 恢复输入框
-# ============================================================
-
-async def _restore_composer(
-    page: Page,
-    timeout_ms: int = 10_000,
-) -> None:
-
-    try:
-        await page.keyboard.press("Escape")
-    except Exception:
-        pass
-
-    try:
-        editor = await first_visible(
-            page,
-            MESSAGE_INPUTS,
-            timeout_ms,
-        )
-    except Exception:
-        return
-
-    try:
-        await editor.click(
-            timeout=timeout_ms
-        )
-
-        await editor.focus()
-
-    except Exception:
-        pass
-
-
-# ============================================================
-# 发送抖音原生表情
-# ============================================================
-
-async def send_douyin_sticker(
-    page: Page,
-    sticker: Sticker,
-) -> None:
-
-    before = await _mark_latest_outgoing_message(
-        page
-    )
-
-    try:
-
-        button = await first_visible(
-            page,
-            STICKER_BUTTONS,
-        )
-
-        await button.click(
-            force=True
-        )
-
-        panel = await first_visible(
-            page,
-            STICKER_PANELS,
-        )
-
-        # 如果指定了分类
-        if sticker.category:
-
-            category = panel.get_by_text(
-                sticker.category,
-                exact=True,
-            )
-
-            if (
-                await category.count()
-                and await category.first.is_visible()
-            ):
-                await category.first.click()
-
-        name = (
-            sticker.accessible_name
-            or sticker.name
-        )
-
-        # ----------------------------------------------------
-        # 优先通过描述寻找
-        # ----------------------------------------------------
-
-        item = panel.locator(
-            ".emojiEmojiItememojiItem"
-        ).filter(
-            has_text=name
-        )
-
-        for index in range(
-            await item.count()
-        ):
-
-            candidate = item.nth(index)
-
-            description = candidate.locator(
-                ".emojiEmojiItememojiItemDesc"
-            )
-
-            if await description.count():
-
-                text = (
-                    await description.first.inner_text()
-                ).strip()
-
-                if text == name:
-
-                    await _click_and_confirm_sticker(
-                        page,
-                        candidate,
-                        before,
-                        name,
-                    )
-
-                    return
-
-        # ----------------------------------------------------
-        # 备用 selector
-        # ----------------------------------------------------
-
-        candidates = (
-            panel.get_by_role(
-                "img",
-                name=name,
-                exact=True,
-            ),
-            panel.get_by_role(
-                "button",
-                name=name,
-                exact=True,
-            ),
-            panel.locator(
-                f'[aria-label="{_css_escape(name)}"]'
-            ),
-            panel.locator(
-                f'[title="{_css_escape(name)}"]'
-            ),
-            panel.locator(
-                f'[alt="{_css_escape(name)}"]'
-            ),
-        )
-
-        for candidate in candidates:
+        for index in range(min(count, 10)):
+            child = candidate.nth(index)
 
             try:
-                if (
-                    await candidate.count()
-                    and await candidate.first.is_visible()
-                ):
-
-                    await _click_and_confirm_sticker(
-                        page,
-                        candidate.first,
-                        before,
-                        name,
-                    )
-
-                    return
-
+                if not await child.is_visible():
+                    continue
             except Exception:
                 continue
 
-        # ----------------------------------------------------
-        # 最后使用 fallback index
-        # ----------------------------------------------------
+            # ----------------------------------------------------
+            # 4.1 fill
+            # ----------------------------------------------------
 
-        if sticker.fallback_index is not None:
+            try:
+                await _clear_editor(child)
+                await child.fill(content)
 
-            items = panel.locator(
-                '[role="button"], img, [aria-label], [title]'
-            )
+                if await _wait_editor_text(child, content, 1500):
+                    print(
+                        "文字输入方式: nested.fill()"
+                    )
+                    return True
 
-            if (
-                await items.count()
-                > sticker.fallback_index
-            ):
+            except Exception:
+                pass
 
-                await _click_and_confirm_sticker(
-                    page,
-                    items.nth(
-                        sticker.fallback_index
-                    ),
-                    before,
-                    name,
+            # ----------------------------------------------------
+            # 4.2 press_sequentially
+            # ----------------------------------------------------
+
+            try:
+                await _clear_editor(child)
+                await child.click(force=True)
+                await child.press_sequentially(
+                    content,
+                    delay=20,
                 )
 
-                return
+                if await _wait_editor_text(child, content, 2500):
+                    print(
+                        "文字输入方式: "
+                        "nested.press_sequentially()"
+                    )
+                    return True
 
-        raise PageOperationError(
-            f"在抖音表情面板中找不到原生表情: "
-            f"{sticker.name}"
-        )
+            except Exception:
+                pass
 
-    finally:
+            # ----------------------------------------------------
+            # 4.3 insert_text
+            # ----------------------------------------------------
 
-        await _restore_composer(
-            page
-        )
+            try:
+                await _clear_editor(child)
+                await child.click(force=True)
+
+                page = child.page
+
+                try:
+                    await child.focus()
+                except Exception:
+                    pass
+
+                await page.keyboard.insert_text(content)
+
+                if await _wait_editor_text(child, content, 2500):
+                    print(
+                        "文字输入方式: "
+                        "nested.keyboard.insert_text()"
+                    )
+                    return True
+
+            except Exception:
+                pass
+
+    return False
 
 
-# ============================================================
-# CSS 转义
-# ============================================================
+async def _mark_latest_outgoing_message(page: Page) -> str | None:
+    """
+    给当前最新的自己发送的消息打一个临时标记。
 
-def _css_escape(
-    value: str,
-) -> str:
-
-    return value.replace(
-        "\\",
-        "\\\\",
-    ).replace(
-        '"',
-        '\\"',
-    )
-
-
-# ============================================================
-# 标记当前最新消息
-# ============================================================
-
-async def _mark_latest_outgoing_message(
-    page: Page,
-) -> tuple[str, str]:
-
-    anchor = secrets.token_hex(8)
-
-    latest = page.locator(
-        LATEST_OUTGOING_MESSAGE
-    ).first
-
-    if not await latest.count():
-        return anchor, ""
-
-    content = latest.locator(
-        '[data-e2e="msg-item-content"]'
-    ).first
-
-    if await content.count():
-
-        before_content = (
-            await content.inner_html()
-        )
-
-    else:
-
-        before_content = (
-            await latest.inner_html()
-        )
+    用于后续判断发送是否产生了新的消息。
+    """
 
     try:
-        await latest.evaluate(
-            """(element, value) => {
-                element.setAttribute(
-                    'data-douyin-sender-anchor',
-                    value
-                );
-            }""",
-            anchor,
-        )
-    except Exception:
-        pass
+        locator = page.locator(LATEST_OUTGOING_MESSAGE).first
 
-    return anchor, before_content
-
-
-# ============================================================
-# 检查最新消息是否发生变化
-# ============================================================
-
-async def _latest_message_changed(
-    page: Page,
-    before: tuple[str, str],
-) -> bool:
-
-    anchor, before_content = before
-
-    latest = page.locator(
-        LATEST_OUTGOING_MESSAGE
-    ).first
-
-    try:
-
-        if not await latest.count():
-            return False
-
-        current_anchor = await latest.get_attribute(
-            MESSAGE_CONFIRM_ANCHOR
-        )
-
-        if current_anchor != anchor:
-            return True
-
-        content = latest.locator(
-            '[data-e2e="msg-item-content"]'
-        ).first
-
-        if await content.count():
-            current_content = await content.inner_html()
-        else:
-            current_content = await latest.inner_html()
-
-        return current_content != before_content
-
-    except Exception:
-        return False
-
-
-# ============================================================
-# 等待新的发送消息
-# ============================================================
-
-async def _wait_for_new_outgoing_message(
-    page: Page,
-    before: tuple[str, str],
-    timeout_ms: int = 15_000,
-    expected_text: str = "",
-    expected_resource: str = "",
-) -> bool:
-
-    deadline = (
-        _monotonic()
-        + timeout_ms / 1000
-    )
-
-    while _monotonic() < deadline:
+        if await locator.count() == 0:
+            return None
 
         try:
-
-            if await _latest_message_changed(
-                page,
-                before,
-            ):
-
-                latest = page.locator(
-                    LATEST_OUTGOING_MESSAGE
-                ).first
-
-                content = latest.locator(
-                    '[data-e2e="msg-item-content"]'
-                ).first
-
-                if not await content.count():
-                    content = latest
-
-                # ------------------------------------------------
-                # 如果是文字消息
-                # ------------------------------------------------
-
-                if expected_text:
-
-                    text = ""
-
-                    try:
-                        text = await content.inner_text()
-                    except Exception:
-                        pass
-
-                    normalized_actual = (
-                        " ".join(
-                            (text or "").split()
-                        )
-                    )
-
-                    normalized_expected = (
-                        " ".join(
-                            (expected_text or "").split()
-                        )
-                    )
-
-                    if (
-                        normalized_expected
-                        and normalized_expected
-                        not in normalized_actual
-                    ):
-                        await page.wait_for_timeout(
-                            SEND_POLL_INTERVAL_MS
-                        )
-                        continue
-
-                # ------------------------------------------------
-                # 如果是图片/表情资源
-                # ------------------------------------------------
-
-                if expected_resource:
-
-                    images = content.locator("img")
-
-                    try:
-                        image_count = await images.count()
-                    except Exception:
-                        image_count = 0
-
-                    if image_count == 0:
-                        await page.wait_for_timeout(
-                            SEND_POLL_INTERVAL_MS
-                        )
-                        continue
-
-                    if expected_resource:
-
-                        resource_found = False
-
-                        for index in range(image_count):
-
-                            image = images.nth(index)
-
-                            try:
-                                src = (
-                                    await image.get_attribute(
-                                        "src"
-                                    )
-                                    or ""
-                                )
-
-                                if (
-                                    expected_resource
-                                    in src
-                                ):
-                                    resource_found = True
-                                    break
-
-                            except Exception:
-                                continue
-
-                        # 有图片就允许继续。
-                        # 某些情况下 CDN URL 会发生变化。
-                        if not resource_found:
-                            pass
-
-                return True
-
+            return await locator.get_attribute(
+                MESSAGE_CONFIRM_ANCHOR
+            )
         except Exception:
             pass
 
-        await page.wait_for_timeout(
-            SEND_POLL_INTERVAL_MS
-        )
-
-    return False
-
-
-# ============================================================
-# 点击并确认表情
-# ============================================================
-
-async def _click_and_confirm_sticker(
-    page: Page,
-    item,
-    before: tuple[str, str],
-    name: str,
-) -> None:
-
-    resource_key = (
-        await _sticker_resource_key(item)
-    )
-
-    await item.click(
-        force=True
-    )
-
-    try:
-
-        await _confirm_sticker_sent(
-            page,
-            before,
-            name,
-            resource_key,
-        )
-
-    except PageOperationError:
-
-        if await _publish_ready(page):
-
-            await _trigger_send(page)
-
-            await _confirm_sticker_sent(
-                page,
-                before,
-                name,
-                resource_key,
-            )
-
-        else:
-            raise
-
-
-# ============================================================
-# 获取表情资源 Key
-# ============================================================
-
-async def _sticker_resource_key(
-    item,
-) -> str:
-
-    src = await item.get_attribute(
-        "src"
-    )
-
-    if not src:
-
-        image = item.locator(
-            "img"
-        ).first
-
-        if await image.count():
-            src = await image.get_attribute(
-                "src"
-            )
-
-    if not src:
-        return ""
-
-    return urlsplit(
-        src
-    ).path.rsplit(
-        "/",
-        1
-    )[-1]
-
-
-# ============================================================
-# 确认表情发送
-# ============================================================
-
-async def _confirm_sticker_sent(
-    page: Page,
-    before: tuple[str, str],
-    name: str,
-    resource_key: str = "",
-) -> None:
-
-    await _confirm_outgoing_message(
-        page,
-        before,
-        f"原生表情“{name}”",
-        resource_key=resource_key,
-    )
-
-
-# ============================================================
-# 查找可见状态元素
-# ============================================================
-
-async def _marker_visible(
-    scope: Locator,
-    selectors: tuple[str, ...],
-) -> bool:
-
-    for selector in selectors:
-
-        marker = scope.locator(
-            selector
-        ).first
+        marker = secrets.token_hex(8)
 
         try:
-
-            if (
-                await marker.count()
-                and await marker.is_visible()
-            ):
-                return True
-
+            await locator.evaluate(
+                """
+                (el, data) => {
+                    el.setAttribute(data.name, data.value);
+                }
+                """,
+                {
+                    "name": MESSAGE_CONFIRM_ANCHOR,
+                    "value": marker,
+                },
+            )
         except Exception:
-            continue
+            return None
 
-    return False
+        return marker
 
+    except Exception:
+        return None
 
-# ============================================================
-# 调试：返回实际命中的失败 selector
-# ============================================================
 
 async def _find_visible_marker(
-    scope: Locator,
-    selectors: tuple[str, ...],
-) -> tuple[str, str] | None:
+    page: Page,
+    markers: tuple[str, ...],
+) -> Locator | None:
+    """
+    寻找页面中可见的 selector。
+    """
 
-    for selector in selectors:
-
-        marker = scope.locator(
-            selector
-        ).first
-
+    for selector in markers:
         try:
+            locator = page.locator(selector)
 
-            if (
-                await marker.count()
-                and await marker.is_visible()
-            ):
+            count = await locator.count()
+
+            if count <= 0:
+                continue
+
+            for index in range(min(count, 10)):
+                item = locator.nth(index)
 
                 try:
-
-                    html = await marker.evaluate(
-                        "(element) => element.outerHTML"
-                    )
-
+                    if await item.is_visible():
+                        return item
                 except Exception:
-
-                    html = "<无法读取 outerHTML>"
-
-                return (
-                    selector,
-                    html[:2000],
-                )
+                    continue
 
         except Exception:
             continue
@@ -1015,317 +537,591 @@ async def _find_visible_marker(
     return None
 
 
-# ============================================================
-# 输出详细失败信息
-# ============================================================
+async def _raise_send_failure(page: Page) -> None:
+    """
+    检查页面上是否出现发送失败标志。
+    """
 
-async def _raise_send_failure(
-    scope: Locator,
-    label: str,
-) -> None:
-
-    failure = await _find_visible_marker(
-        scope,
+    marker = await _find_visible_marker(
+        page,
         SEND_FAILURE_MARKERS,
     )
 
-    if failure is None:
+    if marker is None:
+        return
 
-        raise PageOperationError(
-            f"{label}发送失败，页面提示可以重试"
-        )
-
-    selector, html = failure
+    details = []
 
     try:
-
-        marker = scope.locator(
-            selector
-        ).first
-
-        text = (
-            await marker.inner_text()
-        ).strip()
-
+        text = await marker.inner_text()
+        if text:
+            details.append(text.strip())
     except Exception:
-
-        text = ""
+        pass
 
     try:
-
-        marker = scope.locator(
-            selector
-        ).first
-
-        aria_label = (
-            await marker.get_attribute(
-                "aria-label"
-            )
-        )
-
+        title = await marker.get_attribute("title")
+        if title:
+            details.append(title)
     except Exception:
-
-        aria_label = None
+        pass
 
     try:
-
-        marker = scope.locator(
-            selector
-        ).first
-
-        title = (
-            await marker.get_attribute(
-                "title"
-            )
-        )
-
+        aria = await marker.get_attribute("aria-label")
+        if aria:
+            details.append(aria)
     except Exception:
+        pass
 
-        title = None
+    message = "；".join(x for x in details if x)
 
-    print("")
-    print("=" * 70)
-    print("发送失败调试信息")
-    print("=" * 70)
-    print(f"消息类型: {label}")
-    print(f"命中 selector: {selector}")
-    print(f"元素文本: {text!r}")
-    print(f"aria-label: {aria_label!r}")
-    print(f"title: {title!r}")
-    print(f"outerHTML: {html}")
-    print("=" * 70)
-    print("")
+    if not message:
+        message = "页面检测到发送失败状态"
 
     raise PageOperationError(
-        f"{label}发送失败，页面提示可以重试 "
-        f"(命中 selector: {selector})"
+        f"文字发送失败: {message}"
     )
 
-
-# ============================================================
-# 等待发送状态
-# ============================================================
 
 async def _await_send_terminal_state(
     page: Page,
-    scope: Locator,
-    label: str,
-    timeout_ms: int = SEND_CONFIRM_TIMEOUT_MS,
+    timeout_ms: int = 15000,
 ) -> None:
+    """
+    等待发送进入最终状态。
+
+    如果出现失败标记立即抛错。
+    """
 
     deadline = (
-        _monotonic()
+        asyncio.get_running_loop().time()
         + timeout_ms / 1000
     )
 
-    # ========================================================
-    # 第一阶段：观察刚出现的消息
-    # ========================================================
+    while asyncio.get_running_loop().time() < deadline:
+        await _raise_send_failure(page)
 
-    grace_deadline = (
-        _monotonic()
-        + SEND_INITIAL_CLEAN_GRACE_MS / 1000
+        pending = await _find_visible_marker(
+            page,
+            SEND_PENDING_MARKERS,
+        )
+
+        if pending is None:
+            return
+
+        await asyncio.sleep(0.2)
+
+    # 超时前再检查一次失败
+    await _raise_send_failure(page)
+
+
+async def _wait_for_new_outgoing_message(
+    page: Page,
+    before_marker: str | None,
+    timeout_ms: int = 15000,
+) -> bool:
+    """
+    Python/Playwright 轮询是否出现新的自己发送的消息。
+    """
+
+    deadline = (
+        asyncio.get_running_loop().time()
+        + timeout_ms / 1000
     )
 
-    while _monotonic() < grace_deadline:
+    while asyncio.get_running_loop().time() < deadline:
+        await _raise_send_failure(page)
 
-        if _monotonic() >= deadline:
+        try:
+            locator = page.locator(
+                LATEST_OUTGOING_MESSAGE
+            ).first
 
-            raise PageOperationError(
-                f"{label}发送状态未能确认"
-                "（发送超时或状态不确定），"
-                "为避免重复不会自动重试"
-            )
-
-        # ----------------------------------------------------
-        # 检查失败
-        # ----------------------------------------------------
-
-        failure = await _find_visible_marker(
-            scope,
-            SEND_FAILURE_MARKERS,
-        )
-
-        if failure:
-
-            await _raise_send_failure(
-                scope,
-                label,
-            )
-
-        # ----------------------------------------------------
-        # 检查 spinner
-        # ----------------------------------------------------
-
-        if await _marker_visible(
-            scope,
-            SEND_PENDING_MARKERS,
-        ):
-
-            break
-
-        await page.wait_for_timeout(
-            SEND_POLL_INTERVAL_MS
-        )
-
-    else:
-
-        # 连续 2 秒没有失败，也没有 spinner，
-        # 认为发送成功。
-        return
-
-    # ========================================================
-    # 第二阶段：spinner 已出现
-    # ========================================================
-
-    while True:
-
-        if _monotonic() >= deadline:
-
-            raise PageOperationError(
-                f"{label}发送状态未能确认"
-                "（发送超时或状态不确定），"
-                "为避免重复不会自动重试"
-            )
-
-        # ----------------------------------------------------
-        # 检查失败
-        # ----------------------------------------------------
-
-        failure = await _find_visible_marker(
-            scope,
-            SEND_FAILURE_MARKERS,
-        )
-
-        if failure:
-
-            await _raise_send_failure(
-                scope,
-                label,
-            )
-
-        # ----------------------------------------------------
-        # spinner 消失
-        # ----------------------------------------------------
-
-        if not await _marker_visible(
-            scope,
-            SEND_PENDING_MARKERS,
-        ):
-
-            await page.wait_for_timeout(
-                SEND_STABLE_INTERVAL_MS
-            )
-
-            # 再次检查失败
-            failure = await _find_visible_marker(
-                scope,
-                SEND_FAILURE_MARKERS,
-            )
-
-            if failure:
-
-                await _raise_send_failure(
-                    scope,
-                    label,
+            if await locator.count() > 0:
+                marker = await locator.get_attribute(
+                    MESSAGE_CONFIRM_ANCHOR
                 )
 
-            # spinner 仍然没有回来
-            if not await _marker_visible(
-                scope,
-                SEND_PENDING_MARKERS,
-            ):
+                if before_marker is None:
+                    return True
 
-                return
+                if marker != before_marker:
+                    return True
 
-        await page.wait_for_timeout(
-            SEND_POLL_INTERVAL_MS
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.2)
+
+    return False
+
+
+async def _trigger_send(page: Page) -> None:
+    """
+    点击发送按钮。
+
+    多种 selector 依次尝试。
+    """
+
+    button = await first_visible(
+        page,
+        SEND_BUTTONS,
+    )
+
+    if button is not None:
+        try:
+            await button.click(
+                timeout=5000,
+                force=True,
+            )
+            return
+        except Exception as exc:
+            print(
+                f"发送按钮 click 失败，尝试 Enter: {exc}"
+            )
+
+    # 找不到按钮或者点击失败时，尝试 Enter
+    try:
+        await page.keyboard.press("Enter")
+        return
+    except Exception as exc:
+        raise PageOperationError(
+            f"无法点击发送按钮，也无法按 Enter 发送: {exc}"
         )
 
-
-# ============================================================
-# 确认最新消息
-# ============================================================
 
 async def _confirm_outgoing_message(
     page: Page,
-    before: tuple[str, str],
-    label: str,
-    resource_key: str = "",
-    expected_text: str = "",
+    before_marker: str | None,
 ) -> None:
+    """
+    确认消息已经真正进入聊天记录。
+    """
 
-    try:
+    # 先等待发送状态结束
+    await _await_send_terminal_state(
+        page,
+        timeout_ms=10000,
+    )
 
-        # ----------------------------------------------------
-        # 等待新的消息气泡出现
-        # ----------------------------------------------------
+    # 等待新的自己发送的消息出现
+    success = await _wait_for_new_outgoing_message(
+        page,
+        before_marker,
+        timeout_ms=10000,
+    )
 
-        found = await _wait_for_new_outgoing_message(
-            page,
-            before,
-            timeout_ms=15_000,
-            expected_text=expected_text,
-            expected_resource=resource_key,
+    if success:
+        return
+
+    # 最后一轮检查失败状态
+    await _raise_send_failure(page)
+
+    raise PageOperationError(
+        "文字发送后未检测到新的自己发送消息"
+    )
+
+
+async def send_text(
+    chat: DouyinChat,
+    content: str,
+) -> None:
+    """
+    发送文字消息。
+
+    这是本次重点修复的函数。
+    """
+
+    if not content:
+        raise PageOperationError(
+            "发送文字为空"
         )
 
-        if not found:
+    print()
+    print("=" * 70)
+    print(f"准备发送文字，长度: {len(content)}")
+    print(f"文字内容: {content!r}")
+    print("=" * 70)
 
-            raise PageOperationError(
-                f"{label}已触发发送，"
-                "但没有检测到新的已发送消息"
-            )
+    # ------------------------------------------------------------
+    # 获取聊天输入框
+    # ------------------------------------------------------------
 
-        # ----------------------------------------------------
-        # 找到新的消息
-        # ----------------------------------------------------
+    editor = await chat.message_input()
 
-        latest = page.locator(
-            LATEST_OUTGOING_MESSAGE
+    if editor is None:
+        raise PageOperationError(
+            "没有找到聊天输入框"
+        )
+
+    # ------------------------------------------------------------
+    # 找真正可编辑的元素
+    # ------------------------------------------------------------
+
+    editor = await _find_real_editable(editor)
+
+    # ------------------------------------------------------------
+    # 输入文字
+    # ------------------------------------------------------------
+
+    success = await _input_text_with_fallback(
+        editor,
+        content,
+    )
+
+    if not success:
+        print()
+        print("文字输入失败，输出输入框详细信息。")
+
+        await _print_editor_debug(editor)
+
+        raise PageOperationError(
+            "文字未能写入聊天输入框"
+        )
+
+    # ------------------------------------------------------------
+    # 最终确认输入框里确实存在文字
+    # ------------------------------------------------------------
+
+    ready = await _wait_editor_text(
+        editor,
+        content,
+        timeout_ms=3000,
+    )
+
+    if not ready:
+        print()
+        print("输入框最终确认失败。")
+        await _print_editor_debug(editor)
+
+        raise PageOperationError(
+            "文字输入框内容确认失败"
+        )
+
+    print(
+        f"文字已写入输入框: "
+        f"{await _get_editor_text(editor)!r}"
+    )
+
+    # ------------------------------------------------------------
+    # 在发送之前记录最新消息
+    # ------------------------------------------------------------
+
+    page = editor.page
+
+    before = await _mark_latest_outgoing_message(
+        page
+    )
+
+    await page.wait_for_timeout(300)
+
+    # ------------------------------------------------------------
+    # 点击发送
+    # ------------------------------------------------------------
+
+    await _trigger_send(page)
+
+    print("已触发发送动作。")
+
+    # ------------------------------------------------------------
+    # 确认发送结果
+    # ------------------------------------------------------------
+
+    await _confirm_outgoing_message(
+        page,
+        before,
+    )
+
+    print("文字发送确认成功。")
+
+
+async def send_image(
+    chat: DouyinChat,
+    image_path: str,
+) -> None:
+    """
+    发送图片。
+    """
+
+    page = chat.page
+
+    input_locator = await first_visible(
+        page,
+        IMAGE_INPUTS,
+    )
+
+    if input_locator is None:
+        raise PageOperationError(
+            "没有找到图片上传输入框"
+        )
+
+    try:
+        await input_locator.set_input_files(
+            image_path
+        )
+    except Exception as exc:
+        raise PageOperationError(
+            f"图片上传失败: {exc}"
+        )
+
+    await page.wait_for_timeout(
+        random.randint(800, 1600)
+    )
+
+    await _await_send_terminal_state(
+        page,
+        timeout_ms=15000,
+    )
+
+
+async def _open_sticker_panel(
+    page: Page,
+) -> Locator:
+    """
+    打开表情/贴纸面板。
+    """
+
+    button = await first_visible(
+        page,
+        STICKER_BUTTONS,
+    )
+
+    if button is None:
+        raise PageOperationError(
+            "没有找到表情按钮"
+        )
+
+    try:
+        await button.click(
+            force=True
+        )
+    except Exception as exc:
+        raise PageOperationError(
+            f"无法打开表情面板: {exc}"
+        )
+
+    await page.wait_for_timeout(500)
+
+    panel = await first_visible(
+        page,
+        STICKER_PANELS,
+    )
+
+    if panel is None:
+        raise PageOperationError(
+            "点击表情按钮后没有找到表情面板"
+        )
+
+    return panel
+
+
+async def send_sticker(
+    chat: DouyinChat,
+    sticker: Sticker,
+) -> None:
+    """
+    发送贴纸。
+    """
+
+    page = chat.page
+
+    panel = await _open_sticker_panel(
+        page
+    )
+
+    # sticker selector 由 Sticker 模型提供
+    selector = getattr(
+        sticker,
+        "selector",
+        None,
+    )
+
+    if not selector:
+        raise PageOperationError(
+            "Sticker 缺少 selector"
+        )
+
+    try:
+        item = panel.locator(
+            selector
         ).first
 
-        # ----------------------------------------------------
-        # 等待真正的发送状态
-        # ----------------------------------------------------
+        if await item.count() == 0:
+            raise PageOperationError(
+                f"表情面板中没有找到: {selector}"
+            )
 
-        await _await_send_terminal_state(
-            page,
-            latest,
-            label,
+        await item.click(
+            force=True
         )
 
     except PageOperationError:
         raise
 
     except Exception as exc:
-
         raise PageOperationError(
-            f"{label}已触发发送，"
-            "但没有检测到新的已发送消息"
-        ) from exc
-
-    finally:
-
-        # ----------------------------------------------------
-        # 清除 anchor
-        # ----------------------------------------------------
-
-        anchors = page.locator(
-            f"[{MESSAGE_CONFIRM_ANCHOR}]"
+            f"点击贴纸失败: {exc}"
         )
 
-        try:
+    await page.wait_for_timeout(
+        random.randint(500, 1200)
+    )
 
-            await anchors.evaluate_all(
-                """elements =>
-                    elements.forEach(
-                        element =>
-                            element.removeAttribute(
-                                'data-douyin-sender-anchor'
-                            )
-                    )
-                """
+    await _await_send_terminal_state(
+        page,
+        timeout_ms=15000,
+    )
+
+
+async def send_message(
+    chat: DouyinChat,
+    message: Message,
+) -> None:
+    """
+    根据 Message 类型发送消息。
+    """
+
+    message_type = getattr(
+        message,
+        "type",
+        None,
+    )
+
+    # ------------------------------------------------------------
+    # 文字
+    # ------------------------------------------------------------
+
+    if message_type in (
+        "text",
+        "TEXT",
+        None,
+    ):
+        content = getattr(
+            message,
+            "content",
+            None,
+        )
+
+        if content is None:
+            content = getattr(
+                message,
+                "text",
+                None,
             )
 
-        except Exception:
-            pass
+        if content is None:
+            raise PageOperationError(
+                "文字消息没有 content/text"
+            )
+
+        await send_text(
+            chat,
+            str(content),
+        )
+        return
+
+    # ------------------------------------------------------------
+    # 图片
+    # ------------------------------------------------------------
+
+    if message_type in (
+        "image",
+        "IMAGE",
+    ):
+        image_path = getattr(
+            message,
+            "path",
+            None,
+        )
+
+        if image_path is None:
+            image_path = getattr(
+                message,
+                "image_path",
+                None,
+            )
+
+        if image_path is None:
+            raise PageOperationError(
+                "图片消息没有 path/image_path"
+            )
+
+        await send_image(
+            chat,
+            str(image_path),
+        )
+        return
+
+    # ------------------------------------------------------------
+    # 贴纸
+    # ------------------------------------------------------------
+
+    if message_type in (
+        "sticker",
+        "STICKER",
+        "douyin_sticker",
+        "DOUYIN_STICKER",
+    ):
+        sticker = getattr(
+            message,
+            "sticker",
+            None,
+        )
+
+        if sticker is None:
+            raise PageOperationError(
+                "贴纸消息没有 sticker"
+            )
+
+        await send_sticker(
+            chat,
+            sticker,
+        )
+        return
+
+    # ------------------------------------------------------------
+    # 随机消息
+    # ------------------------------------------------------------
+
+    if message_type in (
+        "random",
+        "RANDOM",
+    ):
+        candidates = getattr(
+            message,
+            "messages",
+            None,
+        )
+
+        if not candidates:
+            candidates = getattr(
+                message,
+                "contents",
+                None,
+            )
+
+        if not candidates:
+            raise PageOperationError(
+                "随机消息没有 messages/contents"
+            )
+
+        selected = random.choice(
+            candidates
+        )
+
+        if isinstance(selected, str):
+            await send_text(
+                chat,
+                selected,
+            )
+            return
+
+        await send_message(
+            chat,
+            selected,
+        )
+        return
+
+    raise PageOperationError(
+        f"不支持的消息类型: {message_type!r}"
+    )
