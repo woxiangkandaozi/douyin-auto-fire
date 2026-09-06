@@ -1,4 +1,3 @@
-```python
 from __future__ import annotations
 
 import asyncio
@@ -1173,4 +1172,3 @@ async def _confirm_outgoing_message(
 
         except Exception:
             pass
-```
