@@ -1117,8 +1117,10 @@ async def send_message(
             return
 
         await send_message(
+            page,
             chat,
             selected,
+            task_sticker,
         )
         return
 
